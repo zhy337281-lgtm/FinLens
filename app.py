@@ -218,13 +218,17 @@ def get_news(stock):
 
 st.sidebar.title("AI Equity Research Terminal")
 
-query = st.sidebar.text_input("Search company or ticker", "Oracle")
+query = st.sidebar.text_input(
+    "Search company or ticker",
+    value=st.session_state.get("company","Oracle")
+)
 ticker = search_ticker(query)
 
 page = st.sidebar.radio(
     "Pages",
-    [
-        "Dashboard",
+   [
+    "Home",
+    "Dashboard",
         "Financial Statements",
         "Market Data",
         "Charts & K-Line",
@@ -243,6 +247,57 @@ page = st.sidebar.radio(
 # -----------------------
 # Load Data
 # -----------------------
+if page == "Home":
+
+    st.title("📈 FinLens AI")
+
+    st.markdown(
+        """
+        ### AI-powered Equity Research Platform
+
+        Professional Equity Research for Investors,
+        Finance Students and Analysts.
+        """
+    )
+
+    st.write("")
+
+    home_query = st.text_input(
+        "Search Company",
+        placeholder="Oracle / Microsoft / NVIDIA"
+    )
+
+    if st.button("Start Research"):
+
+        if home_query != "":
+            st.session_state["company"] = home_query
+            st.rerun()
+
+    st.subheader("Popular Companies")
+
+    c1,c2,c3,c4,c5 = st.columns(5)
+
+    if c1.button("Oracle"):
+        st.session_state["company"]="Oracle"
+        st.rerun()
+
+    if c2.button("Microsoft"):
+        st.session_state["company"]="Microsoft"
+        st.rerun()
+
+    if c3.button("NVIDIA"):
+        st.session_state["company"]="NVIDIA"
+        st.rerun()
+
+    if c4.button("Apple"):
+        st.session_state["company"]="Apple"
+        st.rerun()
+
+    if c5.button("TSMC"):
+        st.session_state["company"]="TSMC"
+        st.rerun()
+
+    st.stop()
 
 stock, info = get_company(ticker)
 summary_df, income, bs, cf = get_financial_summary(stock)
@@ -281,7 +336,13 @@ with col_title:
 
 with col_logo:
     if logo_url:
-        st.image(logo_url, width=70)
+      st.markdown(
+        f"""
+        <img src="{logo_url}" width="70"
+        onerror="this.style.display='none'">
+        """,
+        unsafe_allow_html=True
+    )
 
 
 # -----------------------
