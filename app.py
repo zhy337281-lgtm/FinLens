@@ -1,1928 +1,671 @@
+from __future__ import annotations
+
+import hashlib
+import hmac
 import os
-import numbers
-import requests
+from pathlib import Path
+
+import numpy as np
 import pandas as pd
-import yfinance as yf
-import streamlit as st
 import plotly.express as px
-import plotly.graph_objects as go
+import streamlit as st
+import yfinance as yf
+from dotenv import load_dotenv
 
-# -----------------------
-# Optional dependencies
-# -----------------------
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+from analytics import (
+    dcf_valuation,
+    daily_returns,
+    expected_asset_returns,
+    historical_stress,
+    monte_carlo_terminal_values,
+    normalize_weights,
+    portfolio_metrics,
+    risk_contributions,
+    terminal_summary,
+)
 
 try:
     from openai import OpenAI
-except ImportError:
+except ImportError:  # pragma: no cover - surfaced in the UI
     OpenAI = None
 
-try:
-    from streamlit_autorefresh import st_autorefresh
-except ImportError:
-    def st_autorefresh(*args, **kwargs):
-        return None
 
-
-# -----------------------
-# OpenAI Setup
-# -----------------------
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-client = None
-
-if OPENAI_API_KEY and OpenAI is not None:
-    try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-    except Exception:
-        client = None
-
-
-# -----------------------
-# Streamlit Setup
-# -----------------------
+APP_DIR = Path(__file__).resolve().parent
+load_dotenv(APP_DIR / ".env.local")
+load_dotenv(APP_DIR / ".env")
 
 st.set_page_config(
-    page_title="FinLens AI",
-    page_icon="📈",
-    layout="wide"
+    page_title="FinLens | Private Equity Research",
+    page_icon="◈",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 
-# ============================================================
-# Helper Functions
-# ============================================================
-
-def valid_number(x):
-    try:
-        return x is not None and not pd.isna(x)
-    except Exception:
-        return False
-
-
-def fmt_money(x):
-    try:
-        if not valid_number(x):
-            return "N/A"
-
-        x = float(x)
-
-        if abs(x) >= 1_000_000_000_000:
-            return f"${x / 1_000_000_000_000:.2f}T"
-
-        if abs(x) >= 1_000_000_000:
-            return f"${x / 1_000_000_000:.2f}B"
-
-        if abs(x) >= 1_000_000:
-            return f"${x / 1_000_000:.2f}M"
-
-        return f"${x:,.2f}"
-
-    except Exception:
-        return "N/A"
-
-
-def fmt_pct(x):
-    try:
-        if not valid_number(x):
-            return "N/A"
-
-        return f"{float(x) * 100:.1f}%"
-
-    except Exception:
-        return "N/A"
-
-
-def safe_get(info, key, default=None):
-    try:
-        value = info.get(key, default)
-
-        if value in ["", None]:
-            return default
-
-        if pd.isna(value):
-            return default
-
-        return value
-
-    except Exception:
-        return default
-
-
-def safe_divide(a, b):
-    try:
-        if not valid_number(a) or not valid_number(b):
-            return None
-
-        if float(b) == 0:
-            return None
-
-        return float(a) / float(b)
-
-    except Exception:
-        return None
-
-
-def get_statement_value(df, row_name, column):
-    """
-    Safely retrieve a financial statement item.
-    """
-    try:
-        if df is None or df.empty:
-            return None
-
-        if row_name not in df.index:
-            return None
-
-        if column not in df.columns:
-            return None
-
-        value = df.loc[row_name, column]
-
-        if not valid_number(value):
-            return None
-
-        return float(value)
-
-    except Exception:
-        return None
-
-
-# ============================================================
-# Ticker Search
-# ============================================================
-
-def search_ticker(query):
-    query = query.strip()
-
-    if not query:
-        return "ORCL"
-
-    known_map = {
-        "oracle": "ORCL",
-        "microsoft": "MSFT",
-        "nvidia": "NVDA",
-        "apple": "AAPL",
-        "amazon": "AMZN",
-        "tesla": "TSLA",
-        "google": "GOOGL",
-        "alphabet": "GOOGL",
-        "meta": "META",
-        "facebook": "META",
-        "tsmc": "TSM",
-        "sap": "SAP",
-        "salesforce": "CRM"
-    }
-
-    if query.lower() in known_map:
-        return known_map[query.lower()]
-
-    # If user already entered a likely ticker
-    if query.isupper() and len(query) <= 6:
-        return query
-
-    try:
-        url = "https://query2.finance.yahoo.com/v1/finance/search"
-
-        params = {
-            "q": query,
-            "quotes_count": 5,
-            "news_count": 0
-        }
-
-        headers = {
-            "User-Agent": "Mozilla/5.0"
-        }
-
-        response = requests.get(
-            url,
-            params=params,
-            headers=headers,
-            timeout=8
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        quotes = data.get("quotes", [])
-
-        for quote in quotes:
-            if (
-                quote.get("quoteType") == "EQUITY"
-                and quote.get("symbol")
-            ):
-                return quote["symbol"]
-
-    except Exception:
-        pass
-
-    return query.upper()
-
-
-# ============================================================
-# Company / Market Data
-# ============================================================
-
-def get_logo_url(info):
-    website = safe_get(info, "website")
-
-    if not website:
-        return None
-
-    try:
-        domain = (
-            website
-            .replace("https://", "")
-            .replace("http://", "")
-            .split("/")[0]
-        )
-
-        return f"https://logo.clearbit.com/{domain}"
-
-    except Exception:
-        return None
-
-
-@st.cache_resource(show_spinner=False)
-def get_company(ticker):
-    return yf.Ticker(ticker)
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def get_company_info(ticker):
-    try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-
-        if not info:
-            return {}
-
-        return info
-
-    except Exception:
-        return {}
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def get_financial_data(ticker):
-    try:
-        stock = yf.Ticker(ticker)
-
-        income = stock.financials
-        balance_sheet = stock.balance_sheet
-        cashflow = stock.cashflow
-
-        return income, balance_sheet, cashflow
-
-    except Exception:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-
-# ============================================================
-# Financial Summary
-# ============================================================
-
-def get_financial_summary(income, bs, cf):
-
-    rows = []
-
-    if income is None or income.empty:
-        return pd.DataFrame()
-
-    for year in income.columns:
-
-        revenue = get_statement_value(
-            income,
-            "Total Revenue",
-            year
-        )
-
-        gross_profit = get_statement_value(
-            income,
-            "Gross Profit",
-            year
-        )
-
-        ebitda = get_statement_value(
-            income,
-            "EBITDA",
-            year
-        )
-
-        operating_income = get_statement_value(
-            income,
-            "Operating Income",
-            year
-        )
-
-        net_income = get_statement_value(
-            income,
-            "Net Income",
-            year
-        )
-
-        operating_cf = get_statement_value(
-            cf,
-            "Operating Cash Flow",
-            year
-        )
-
-        capex = get_statement_value(
-            cf,
-            "Capital Expenditure",
-            year
-        )
-
-        fcf = get_statement_value(
-            cf,
-            "Free Cash Flow",
-            year
-        )
-
-        total_debt = get_statement_value(
-            bs,
-            "Total Debt",
-            year
-        )
-
-        cash = get_statement_value(
-            bs,
-            "Cash And Cash Equivalents",
-            year
-        )
-
-        # Fallback FCF calculation
-        if fcf is None:
-            if operating_cf is not None and capex is not None:
-                # CapEx often comes from Yahoo as negative
-                fcf = operating_cf + capex
-
-        try:
-            year_display = pd.Timestamp(year).strftime("%Y-%m-%d")
-        except Exception:
-            year_display = str(year)
-
-        rows.append({
-            "Year": year_display,
-            "Revenue": revenue,
-            "Gross Profit": gross_profit,
-            "EBITDA": ebitda,
-            "Operating Income": operating_income,
-            "Net Income": net_income,
-            "Operating Cash Flow": operating_cf,
-            "CapEx": capex,
-            "Free Cash Flow": fcf,
-            "Total Debt": total_debt,
-            "Cash": cash,
-
-            "Gross Margin": safe_divide(
-                gross_profit,
-                revenue
-            ),
-
-            "EBITDA Margin": safe_divide(
-                ebitda,
-                revenue
-            ),
-
-            "Operating Margin": safe_divide(
-                operating_income,
-                revenue
-            ),
-
-            "Net Margin": safe_divide(
-                net_income,
-                revenue
-            ),
-
-            "FCF Margin": safe_divide(
-                fcf,
-                revenue
-            ),
-        })
-
-    return pd.DataFrame(rows)
-
-
-# ============================================================
-# DCF
-# ============================================================
-
-def simple_dcf(
-    latest_fcf,
-    growth,
-    discount_rate,
-    terminal_growth,
-    shares
-):
-
-    try:
-
-        if not valid_number(latest_fcf):
-            return None
-
-        if not valid_number(shares):
-            return None
-
-        if shares <= 0:
-            return None
-
-        if discount_rate <= terminal_growth:
-            return None
-
-        fcfs = []
-
-        for year in range(1, 6):
-            future_fcf = latest_fcf * ((1 + growth) ** year)
-            fcfs.append(future_fcf)
-
-        pv_fcfs = []
-
-        for year, fcf in enumerate(fcfs, start=1):
-            pv = fcf / ((1 + discount_rate) ** year)
-            pv_fcfs.append(pv)
-
-        terminal_value = (
-            fcfs[-1]
-            * (1 + terminal_growth)
-            / (discount_rate - terminal_growth)
-        )
-
-        pv_terminal = (
-            terminal_value
-            / ((1 + discount_rate) ** 5)
-        )
-
-        total_value = (
-            sum(pv_fcfs)
-            + pv_terminal
-        )
-
-        fair_value_per_share = (
-            total_value
-            / shares
-        )
-
-        return fair_value_per_share
-
-    except Exception:
-        return None
-
-
-# ============================================================
-# OpenAI
-# ============================================================
-
-def ai_report(prompt):
-
-    if client is None:
-
-        return """
-### OpenAI API is not configured
-
-The rest of FinLens works normally.
-
-To enable AI features:
-
-1. Create a `.env` file in your project directory.
-2. Add:
-
-`OPENAI_API_KEY=your_api_key_here`
-
-3. Restart Streamlit.
+STYLE = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500&display=swap');
+:root { --ink:#e8edf5; --muted:#8f9bad; --panel:#101722; --line:#223044; --accent:#46d6a0; }
+.stApp { background: #080d14; color: var(--ink); }
+html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
+[data-testid="stSidebar"] { background: #0c121b; border-right: 1px solid var(--line); }
+[data-testid="stMetric"] { background: var(--panel); border: 1px solid var(--line); padding: 16px; border-radius: 12px; }
+[data-testid="stMetricLabel"] { color: var(--muted); }
+[data-testid="stMetricValue"] { font-family: 'IBM Plex Mono', monospace; }
+.block-container { padding-top: 2rem; padding-bottom: 4rem; max-width: 1500px; }
+h1, h2, h3 { letter-spacing: -0.025em; }
+.eyebrow { color: var(--accent); font: 500 0.78rem 'IBM Plex Mono', monospace; letter-spacing: .14em; text-transform: uppercase; }
+.hero { padding: 26px 0 18px; border-bottom: 1px solid var(--line); margin-bottom: 25px; }
+.hero h1 { font-size: 3rem; margin: .25rem 0 .4rem; }
+.hero p { color: var(--muted); max-width: 820px; font-size: 1.05rem; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 20px; height: 100%; }
+.panel h3 { margin-top: 0; }
+.pill { display:inline-block; border:1px solid #2c8064; color:#72e0b5; border-radius:999px; padding:4px 10px; font-size:.78rem; margin-right:6px; }
+.muted { color: var(--muted); }
+.status { display:flex; align-items:center; gap:8px; color:#9ba8ba; font-size:.88rem; }
+.status-dot { width:7px; height:7px; background:var(--accent); border-radius:50%; box-shadow:0 0 12px var(--accent); }
+.stButton > button { border-radius: 9px; font-weight: 600; }
+div[data-testid="stDataFrame"] { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.disclaimer { border-left: 3px solid #805f2c; background:#18140d; color:#b9ad96; padding:12px 14px; border-radius:4px; font-size:.82rem; }
+</style>
 """
+st.markdown(STYLE, unsafe_allow_html=True)
 
+
+def secret_value(name: str) -> str | None:
+    value = os.getenv(name)
+    if value:
+        return str(value)
     try:
-
-        response = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content":
-                        "You are a professional equity research analyst."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
-        )
-
-        return response.choices[0].message.content
-
-    except Exception as e:
-
-        return f"""
-### AI analysis failed
-
-Error:
-
-`{e}`
-"""
-
-
-# ============================================================
-# Competitor Data
-# ============================================================
-
-@st.cache_data(ttl=300, show_spinner=False)
-def get_competitor_table(tickers):
-
-    rows = []
-
-    for ticker in tickers:
-
-        try:
-
-            info = yf.Ticker(ticker).info
-
-            rows.append({
-                "Ticker": ticker,
-                "Name": info.get(
-                    "shortName",
-                    "N/A"
-                ),
-                "Price": info.get(
-                    "currentPrice"
-                ),
-                "Market Cap": info.get(
-                    "marketCap"
-                ),
-                "P/E": info.get(
-                    "trailingPE"
-                ),
-                "Forward P/E": info.get(
-                    "forwardPE"
-                ),
-                "Revenue Growth": info.get(
-                    "revenueGrowth"
-                ),
-                "Profit Margin": info.get(
-                    "profitMargins"
-                ),
-                "ROE": info.get(
-                    "returnOnEquity"
-                ),
-            })
-
-        except Exception:
-            continue
-
-    return pd.DataFrame(rows)
-
-
-def get_news(stock):
-
-    try:
-        news = stock.news
-
-        if not news:
-            return []
-
-        return news[:10]
-
+        value = st.secrets.get(name)
+        return str(value) if value else None
     except Exception:
-        return []
+        return None
 
 
-# ============================================================
-# Sidebar
-# ============================================================
+def require_authentication() -> None:
+    configured_password = secret_value("FINLENS_PASSWORD")
+    if not configured_password:
+        st.error("Private access is not configured. Set `FINLENS_PASSWORD` in the deployment secrets.")
+        st.info("The application is fail-closed: research data is unavailable until a password is configured.")
+        st.stop()
 
-st.sidebar.title("📈 FinLens AI")
-
-default_company = st.session_state.get(
-    "company",
-    "Oracle"
-)
-
-query = st.sidebar.text_input(
-    "Search company or ticker",
-    value=default_company
-)
-
-ticker = search_ticker(query)
-
-page = st.sidebar.radio(
-    "Pages",
-    [
-        "Home",
-        "Dashboard",
-        "Financial Statements",
-        "Market Data",
-        "Charts & K-Line",
-        "DCF Valuation",
-        "P/E EPS Valuation",
-        "Analyst Price Targets",
-        "Business & Moat",
-        "Competitors & Risk",
-        "News & AI Analysis",
-        "AI Report",
-        "Watchlist"
-    ]
-)
-
-
-# ============================================================
-# Home Page
-# ============================================================
-
-if page == "Home":
-
-    st.title("📈 FinLens AI")
+    expected = hashlib.sha256(configured_password.encode("utf-8")).digest()
+    if st.session_state.get("authenticated"):
+        return
 
     st.markdown(
         """
-### AI-powered Equity Research Platform
-
-Professional Equity Research for:
-
-- Investors
-- Finance Students
-- Analysts
-- Equity Research Learners
-"""
+        <div class="hero">
+          <div class="eyebrow">Private research system</div>
+          <h1>FinLens</h1>
+          <p>Personal equity research, valuation and portfolio intelligence.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
-
-    st.write("")
-
-    home_query = st.text_input(
-        "Search Company",
-        placeholder="Oracle / Microsoft / NVIDIA"
-    )
-
-    if st.button("Start Research"):
-
-        if home_query.strip():
-
-            st.session_state["company"] = (
-                home_query.strip()
-            )
-
-            st.success(
-                "Company selected. "
-                "Open Dashboard from the sidebar."
-            )
-
-    st.subheader("Popular Companies")
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-
-    if c1.button("Oracle"):
-        st.session_state["company"] = "Oracle"
-        st.rerun()
-
-    if c2.button("Microsoft"):
-        st.session_state["company"] = "Microsoft"
-        st.rerun()
-
-    if c3.button("NVIDIA"):
-        st.session_state["company"] = "NVIDIA"
-        st.rerun()
-
-    if c4.button("Apple"):
-        st.session_state["company"] = "Apple"
-        st.rerun()
-
-    if c5.button("TSMC"):
-        st.session_state["company"] = "TSMC"
-        st.rerun()
-
+    candidate = st.text_input("Access password", type="password", placeholder="Enter your private password")
+    if st.button("Unlock workspace", type="primary", width="stretch"):
+        supplied = hashlib.sha256(candidate.encode("utf-8")).digest()
+        if hmac.compare_digest(supplied, expected):
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
     st.stop()
 
 
-# ============================================================
-# Load Company Data
-# ============================================================
-
-with st.spinner(
-    f"Loading {ticker} data..."
-):
-
-    stock = get_company(ticker)
-
-    info = get_company_info(ticker)
-
-    income, bs, cf = get_financial_data(
-        ticker
-    )
-
-    summary_df = get_financial_summary(
-        income,
-        bs,
-        cf
-    )
-
-
-# ============================================================
-# Validate Company
-# ============================================================
-
-if not info:
-
-    st.error(
-        f"Could not load data for `{ticker}`. "
-        "Please check the company name or ticker."
-    )
-
-    st.stop()
-
-
-# ============================================================
-# Core Company Information
-# ============================================================
-
-company_name = safe_get(
-    info,
-    "longName",
-    ticker
-)
-
-price = safe_get(
-    info,
-    "currentPrice",
-    safe_get(
-        info,
-        "regularMarketPrice"
-    )
-)
-
-regular_price = safe_get(
-    info,
-    "regularMarketPrice",
-    price
-)
-
-pre_price = safe_get(
-    info,
-    "preMarketPrice"
-)
-
-post_price = safe_get(
-    info,
-    "postMarketPrice"
-)
-
-market_cap = safe_get(
-    info,
-    "marketCap"
-)
-
-pe = safe_get(
-    info,
-    "trailingPE"
-)
-
-forward_pe = safe_get(
-    info,
-    "forwardPE"
-)
-
-eps = safe_get(
-    info,
-    "trailingEps"
-)
-
-forward_eps = safe_get(
-    info,
-    "forwardEps"
-)
-
-shares = safe_get(
-    info,
-    "sharesOutstanding"
-)
-
-sector = safe_get(
-    info,
-    "sector",
-    "N/A"
-)
-
-industry = safe_get(
-    info,
-    "industry",
-    "N/A"
-)
-
-target_mean = safe_get(
-    info,
-    "targetMeanPrice"
-)
-
-target_high = safe_get(
-    info,
-    "targetHighPrice"
-)
-
-target_low = safe_get(
-    info,
-    "targetLowPrice"
-)
-
-
-# ============================================================
-# Header
-# ============================================================
-
-logo_url = get_logo_url(info)
-
-col_title, col_logo = st.columns(
-    [8, 1]
-)
-
-with col_title:
-
-    st.title(
-        f"{company_name} ({ticker})"
-    )
-
-    st.caption(
-        f"{sector} | {industry}"
-    )
-
-with col_logo:
-
-    if logo_url:
-
-        st.markdown(
-            f"""
-<img
-src="{logo_url}"
-width="70"
-onerror="this.style.display='none'"
->
-""",
-            unsafe_allow_html=True
-        )
-
-
-# ============================================================
-# Dashboard
-# ============================================================
-
-if page == "Dashboard":
-
-    st_autorefresh(
-        interval=60_000,
-        key="dashboard_refresh"
-    )
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric(
-        "Current Price",
-        fmt_money(price)
-    )
-
-    col2.metric(
-        "Market Cap",
-        fmt_money(market_cap)
-    )
-
-    col3.metric(
-        "P/E",
-        f"{pe:.2f}"
-        if valid_number(pe)
-        else "N/A"
-    )
-
-    col4.metric(
-        "Forward P/E",
-        f"{forward_pe:.2f}"
-        if valid_number(forward_pe)
-        else "N/A"
-    )
-
-    st.subheader(
-        "Financial Snapshot"
-    )
-
-    if summary_df.empty:
-
-        st.warning(
-            "Financial statement data "
-            "is unavailable."
-        )
-
-    else:
-
-        display_df = summary_df.copy()
-
-        money_cols = [
-            "Revenue",
-            "Gross Profit",
-            "EBITDA",
-            "Operating Income",
-            "Net Income",
-            "Operating Cash Flow",
-            "CapEx",
-            "Free Cash Flow",
-            "Total Debt",
-            "Cash"
-        ]
-
-        pct_cols = [
-            "Gross Margin",
-            "EBITDA Margin",
-            "Operating Margin",
-            "Net Margin",
-            "FCF Margin"
-        ]
-
-        for col in money_cols:
-
-            if col in display_df.columns:
-                display_df[col] = (
-                    display_df[col]
-                    .apply(fmt_money)
-                )
-
-        for col in pct_cols:
-
-            if col in display_df.columns:
-                display_df[col] = (
-                    display_df[col]
-                    .apply(fmt_pct)
-                )
-
-        st.dataframe(
-            display_df,
-            use_container_width=True
-        )
-
-
-# ============================================================
-# Financial Statements
-# ============================================================
-
-elif page == "Financial Statements":
-
-    def format_statement(df):
-
-        if df is None or df.empty:
-            return pd.DataFrame()
-
-        formatted = df.T.copy()
-
-        for col in formatted.columns:
-
-            formatted[col] = (
-                formatted[col]
-                .apply(
-                    lambda x:
-                        fmt_money(x)
-                        if isinstance(
-                            x,
-                            numbers.Number
-                        )
-                        else x
-                )
-            )
-
-        return formatted
-
-
-    st.subheader(
-        "Income Statement"
-    )
-
-    if income.empty:
-        st.warning("No income statement available.")
-    else:
-        st.dataframe(
-            format_statement(income),
-            use_container_width=True
-        )
-
-
-    st.subheader(
-        "Balance Sheet"
-    )
-
-    if bs.empty:
-        st.warning("No balance sheet available.")
-    else:
-        st.dataframe(
-            format_statement(bs),
-            use_container_width=True
-        )
-
-
-    st.subheader(
-        "Cash Flow Statement"
-    )
-
-    if cf.empty:
-        st.warning("No cash flow statement available.")
-    else:
-        st.dataframe(
-            format_statement(cf),
-            use_container_width=True
-        )
-
-
-# ============================================================
-# Market Data
-# ============================================================
-
-elif page == "Market Data":
-
-    st_autorefresh(
-        interval=60_000,
-        key="market_refresh"
-    )
-
-    pre_change = (
-        safe_divide(
-            pre_price - regular_price,
-            regular_price
-        )
-        if valid_number(pre_price)
-        and valid_number(regular_price)
-        else None
-    )
-
-    post_change = (
-        safe_divide(
-            post_price - regular_price,
-            regular_price
-        )
-        if valid_number(post_price)
-        and valid_number(regular_price)
-        else None
-    )
-
-    col1, col2, col3 = st.columns(3)
-
-    col1.metric(
-        "Regular Market Price",
-        fmt_money(regular_price)
-    )
-
-    col2.metric(
-        "Pre-Market Price",
-        fmt_money(pre_price),
-        fmt_pct(pre_change)
-        if valid_number(pre_change)
-        else None
-    )
-
-    col3.metric(
-        "After-Hours Price",
-        fmt_money(post_price),
-        fmt_pct(post_change)
-        if valid_number(post_change)
-        else None
-    )
-
-    col4, col5, col6 = st.columns(3)
-
-    col4.metric(
-        "Market Cap",
-        fmt_money(market_cap)
-    )
-
-    col5.metric(
-        "Beta",
-        safe_get(info, "beta", "N/A")
-    )
-
-    col6.metric(
-        "Volume",
-        safe_get(info, "volume", "N/A")
-    )
-
-    col7, col8, col9 = st.columns(3)
-
-    col7.metric(
-        "52W High",
-        fmt_money(
-            safe_get(
-                info,
-                "fiftyTwoWeekHigh"
-            )
-        )
-    )
-
-    col8.metric(
-        "52W Low",
-        fmt_money(
-            safe_get(
-                info,
-                "fiftyTwoWeekLow"
-            )
-        )
-    )
-
-    col9.metric(
-        "Dividend Yield",
-        fmt_pct(
-            safe_get(
-                info,
-                "dividendYield"
-            )
-        )
-    )
-
-    st.caption(
-        "Pre-market and after-hours "
-        "data availability depends on "
-        "Yahoo Finance coverage."
-    )
-
-
-# ============================================================
-# Charts
-# ============================================================
-
-elif page == "Charts & K-Line":
-
-    period = st.selectbox(
-        "Period",
-        [
-            "1mo",
-            "3mo",
-            "6mo",
-            "1y",
-            "5y"
-        ],
-        index=3
-    )
-
+def valid_number(value) -> bool:
     try:
+        return value is not None and bool(np.isfinite(float(value)))
+    except (TypeError, ValueError):
+        return False
 
-        hist = stock.history(
-            period=period
-        )
 
+def money(value, decimals: int = 2) -> str:
+    if not valid_number(value):
+        return "—"
+    value = float(value)
+    sign = "-" if value < 0 else ""
+    absolute = abs(value)
+    for threshold, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M")):
+        if absolute >= threshold:
+            return f"{sign}${absolute / threshold:.{decimals}f}{suffix}"
+    return f"{sign}${absolute:,.{decimals}f}"
+
+
+def percent(value, decimals: int = 1) -> str:
+    return f"{float(value) * 100:.{decimals}f}%" if valid_number(value) else "—"
+
+
+def multiple(value) -> str:
+    return f"{float(value):.1f}×" if valid_number(value) else "—"
+
+
+def safe(info: dict, key: str, default=None):
+    value = info.get(key, default)
+    if value is None or value == "":
+        return default
+    try:
+        return default if pd.isna(value) else value
+    except (TypeError, ValueError):
+        return value
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def company_bundle(ticker: str):
+    stock = yf.Ticker(ticker)
+    try:
+        info = stock.info or {}
     except Exception:
-
-        hist = pd.DataFrame()
-
-
-    if hist.empty:
-
-        st.warning(
-            "Price history unavailable."
-        )
-
-    else:
-
-        st.subheader(
-            "Line Chart"
-        )
-
-        fig = px.line(
-            hist,
-            x=hist.index,
-            y="Close",
-            title=f"{ticker} Closing Price"
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
-
-
-        st.subheader(
-            "K-Line / Candlestick Chart"
-        )
-
-        fig = go.Figure(
-            data=[
-                go.Candlestick(
-                    x=hist.index,
-                    open=hist["Open"],
-                    high=hist["High"],
-                    low=hist["Low"],
-                    close=hist["Close"]
-                )
-            ]
-        )
-
-        fig.update_layout(
-            title=f"{ticker} Candlestick Chart",
-            xaxis_rangeslider_visible=False
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
-
-
-# ============================================================
-# DCF
-# ============================================================
-
-elif page == "DCF Valuation":
-
-    st.subheader(
-        "DCF Valuation"
-    )
-
-    latest_fcf = None
-
-    if (
-        not summary_df.empty
-        and "Free Cash Flow"
-        in summary_df.columns
-    ):
-
-        fcf_series = (
-            summary_df["Free Cash Flow"]
-            .dropna()
-        )
-
-        if not fcf_series.empty:
-            latest_fcf = (
-                float(fcf_series.iloc[0])
-            )
-
-
-    st.write(
-        "Latest FCF:",
-        fmt_money(latest_fcf)
-    )
-
-    growth = st.slider(
-        "FCF Growth Rate",
-        0.00,
-        0.20,
-        0.06
-    )
-
-    discount_rate = st.slider(
-        "Discount Rate / WACC",
-        0.05,
-        0.15,
-        0.09
-    )
-
-    terminal_growth = st.slider(
-        "Terminal Growth Rate",
-        0.00,
-        0.05,
-        0.025
-    )
-
-    fair_value = simple_dcf(
-        latest_fcf,
-        growth,
-        discount_rate,
-        terminal_growth,
-        shares
-    )
-
-    col1, col2 = st.columns(2)
-
-    col1.metric(
-        "DCF Fair Value / Share",
-        fmt_money(fair_value)
-    )
-
-    col2.metric(
-        "Current Price",
-        fmt_money(price)
-    )
-
-    st.caption(
-        "This simplified DCF is for "
-        "educational purposes and is "
-        "not investment advice."
-    )
-
-
-# ============================================================
-# P/E EPS Valuation
-# ============================================================
-
-elif page == "P/E EPS Valuation":
-
-    st.subheader(
-        "P/E × EPS Valuation"
-    )
-
-    base_eps = (
-        float(forward_eps)
-        if valid_number(forward_eps)
-        else (
-            float(eps)
-            if valid_number(eps)
-            else 5.0
-        )
-    )
-
-    st.write(
-        "Forward EPS:",
-        forward_eps
-        if valid_number(forward_eps)
-        else "N/A"
-    )
-
-    st.write(
-        "Trailing EPS:",
-        eps
-        if valid_number(eps)
-        else "N/A"
-    )
-
-    bear_pe = st.slider(
-        "Bear Case P/E",
-        5,
-        60,
-        15
-    )
-
-    base_pe = st.slider(
-        "Base Case P/E",
-        5,
-        60,
-        25
-    )
-
-    bull_pe = st.slider(
-        "Bull Case P/E",
-        5,
-        80,
-        35
-    )
-
-    custom_eps = st.number_input(
-        "Adjust EPS",
-        value=base_eps
-    )
-
-    bear_price = (
-        bear_pe
-        * custom_eps
-    )
-
-    base_price = (
-        base_pe
-        * custom_eps
-    )
-
-    bull_price = (
-        bull_pe
-        * custom_eps
-    )
-
-    col1, col2, col3 = st.columns(3)
-
-    col1.metric(
-        "Bear Case Price",
-        fmt_money(bear_price)
-    )
-
-    col2.metric(
-        "Base Case Price",
-        fmt_money(base_price)
-    )
-
-    col3.metric(
-        "Bull Case Price",
-        fmt_money(bull_price)
-    )
-
-    valuation_df = pd.DataFrame({
-        "Case": [
-            "Bear",
-            "Base",
-            "Bull"
-        ],
-        "EPS": [
-            custom_eps,
-            custom_eps,
-            custom_eps
-        ],
-        "P/E": [
-            bear_pe,
-            base_pe,
-            bull_pe
-        ],
-        "Implied Price": [
-            bear_price,
-            base_price,
-            bull_price
-        ]
-    })
-
-    st.dataframe(
-        valuation_df,
-        use_container_width=True
-    )
-
-
-# ============================================================
-# Analyst Targets
-# ============================================================
-
-elif page == "Analyst Price Targets":
-
-    st.subheader(
-        "Analyst Price Targets"
-    )
-
-    target_df = pd.DataFrame({
-        "Estimate": [
-            "Low Target",
-            "Mean Target",
-            "High Target"
-        ],
-        "Price": [
-            target_low,
-            target_mean,
-            target_high
-        ]
-    })
-
-    st.dataframe(
-        target_df,
-        use_container_width=True
-    )
-
-    valid_targets = (
-        target_df
-        .dropna(subset=["Price"])
-    )
-
-    if not valid_targets.empty:
-
-        fig = px.bar(
-            valid_targets,
-            x="Estimate",
-            y="Price",
-            title="Analyst Target Price Range"
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
-
-    else:
-
-        st.warning(
-            "Analyst price target data "
-            "is unavailable."
-        )
-
-
-# ============================================================
-# Business & Moat
-# ============================================================
-
-elif page == "Business & Moat":
-
-    st.subheader(
-        "Company Introduction, Moat & Fundamentals"
-    )
-
-    prompt = f"""
-Company: {company_name}
-Ticker: {ticker}
-Sector: {sector}
-Industry: {industry}
-Market Cap: {market_cap}
-P/E: {pe}
-
-Write a professional equity research analysis covering:
-
-1. Company introduction
-2. Main business segments
-3. Revenue sources
-4. Business model
-5. Business fundamentals
-6. Economic moat
-7. Switching costs
-8. Scale advantages
-9. Competitive risks
-10. Long-term outlook
-"""
-
-    if st.button(
-        "Generate Business & Moat Analysis"
-    ):
-
-        with st.spinner(
-            "Generating..."
-        ):
-
-            st.markdown(
-                ai_report(prompt)
-            )
-
-
-# ============================================================
-# Competitors & Risk
-# ============================================================
-
-elif page == "Competitors & Risk":
-
-    st.subheader(
-        "Competitor Comparison"
-    )
-
-    default_peers = (
-        "MSFT,AMZN,SAP,CRM"
-    )
-
-    peer_input = st.text_input(
-        "Peer tickers",
-        default_peers
-    )
-
-    peer_tickers = [
-        x.strip().upper()
-        for x
-        in peer_input.split(",")
-        if x.strip()
-    ]
-
-    comp_df = get_competitor_table(
-        [ticker] + peer_tickers
-    )
-
-    display_comp = (
-        comp_df.copy()
-    )
-
-    if not display_comp.empty:
-
-        if "Market Cap" in display_comp:
-            display_comp["Market Cap"] = (
-                display_comp["Market Cap"]
-                .apply(fmt_money)
-            )
-
-        for col in [
-            "Revenue Growth",
-            "Profit Margin",
-            "ROE"
-        ]:
-
-            if col in display_comp:
-
-                display_comp[col] = (
-                    display_comp[col]
-                    .apply(fmt_pct)
-                )
-
-        st.dataframe(
-            display_comp,
-            use_container_width=True
-        )
-
-    else:
-
-        st.warning(
-            "Competitor data unavailable."
-        )
-
-
-    st.subheader(
-        "Risk Analysis"
-    )
-
-    prompt = f"""
-Company: {company_name}
-Ticker: {ticker}
-Sector: {sector}
-Industry: {industry}
-
-Competitor Data:
-
-{comp_df.to_string()}
-
-Write a company-specific risk analysis:
-
-1. Competitive risk
-2. Margin risk
-3. Valuation risk
-4. Business model risk
-5. Macroeconomic risk
-6. Execution risk
-
-Also compare the company against its competitors.
-"""
-
-    if st.button(
-        "Generate Risk Analysis"
-    ):
-
-        with st.spinner(
-            "Generating risk analysis..."
-        ):
-
-            st.markdown(
-                ai_report(prompt)
-            )
-
-
-# ============================================================
-# News
-# ============================================================
-
-elif page == "News & AI Analysis":
-
-    st.subheader(
-        "Latest Company News"
-    )
-
-    news = get_news(stock)
-
-    news_rows = []
-
-    for item in news:
-
+        info = {}
+    frames = []
+    for attribute in ("financials", "balance_sheet", "cashflow"):
         try:
+            frame = getattr(stock, attribute)
+            frames.append(frame if frame is not None else pd.DataFrame())
+        except Exception:
+            frames.append(pd.DataFrame())
+    return info, frames[0], frames[1], frames[2]
 
-            content = item.get(
-                "content",
-                item
+
+@st.cache_data(ttl=600, show_spinner=False)
+def price_history(tickers: tuple[str, ...], period: str = "5y") -> pd.DataFrame:
+    symbols = list(dict.fromkeys(ticker.upper() for ticker in tickers if ticker))
+    if not symbols:
+        return pd.DataFrame()
+    raw = yf.download(symbols, period=period, auto_adjust=True, progress=False, group_by="column", threads=True)
+    if raw.empty:
+        return pd.DataFrame()
+    if isinstance(raw.columns, pd.MultiIndex):
+        if "Close" in raw.columns.get_level_values(0):
+            close = raw["Close"]
+        elif "Close" in raw.columns.get_level_values(1):
+            close = raw.xs("Close", axis=1, level=1)
+        else:
+            return pd.DataFrame()
+    else:
+        close = raw[["Close"]].rename(columns={"Close": symbols[0]})
+    if isinstance(close, pd.Series):
+        close = close.to_frame(symbols[0])
+    close.columns = [str(column).upper() for column in close.columns]
+    return close.sort_index().ffill().dropna(how="all")
+
+
+def statement_value(frame: pd.DataFrame, rows: list[str]):
+    if frame is None or frame.empty:
+        return None
+    for row in rows:
+        if row in frame.index:
+            values = pd.to_numeric(frame.loc[row], errors="coerce").dropna()
+            if not values.empty:
+                return float(values.iloc[0])
+    return None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def peer_snapshot(tickers: tuple[str, ...]) -> pd.DataFrame:
+    rows = []
+    for ticker in tickers:
+        try:
+            info = yf.Ticker(ticker).info or {}
+            rows.append(
+                {
+                    "Ticker": ticker,
+                    "Company": safe(info, "shortName", ticker),
+                    "Market cap": safe(info, "marketCap"),
+                    "Forward P/E": safe(info, "forwardPE"),
+                    "EV/EBITDA": safe(info, "enterpriseToEbitda"),
+                    "Revenue growth": safe(info, "revenueGrowth"),
+                    "EBITDA margin": safe(info, "ebitdaMargins"),
+                    "ROE": safe(info, "returnOnEquity"),
+                }
             )
-
-            title = content.get(
-                "title",
-                item.get(
-                    "title",
-                    "N/A"
-                )
-            )
-
-            provider = content.get(
-                "provider",
-                {}
-            )
-
-            publisher = (
-                provider.get(
-                    "displayName",
-                    item.get(
-                        "publisher",
-                        "N/A"
-                    )
-                )
-            )
-
-            canonical_url = (
-                content.get(
-                    "canonicalUrl",
-                    {}
-                )
-            )
-
-            link = (
-                canonical_url.get(
-                    "url",
-                    item.get(
-                        "link"
-                    )
-                )
-            )
-
-            news_rows.append({
-                "Title": title,
-                "Publisher": publisher,
-                "Link": link
-            })
-
         except Exception:
             continue
+    return pd.DataFrame(rows)
 
 
-    news_df = pd.DataFrame(
-        news_rows
+def display_peer_table(frame: pd.DataFrame) -> pd.DataFrame:
+    result = frame.copy()
+    if result.empty:
+        return result
+    result["Market cap"] = result["Market cap"].map(money)
+    for column in ("Revenue growth", "EBITDA margin", "ROE"):
+        result[column] = result[column].map(percent)
+    for column in ("Forward P/E", "EV/EBITDA"):
+        result[column] = result[column].map(multiple)
+    return result
+
+
+def page_header(kicker: str, title: str, description: str) -> None:
+    st.markdown(
+        f"""
+        <div class="hero">
+          <div class="eyebrow">{kicker}</div>
+          <h1>{title}</h1>
+          <p>{description}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    if news_df.empty:
 
-        st.warning(
-            "No news available."
-        )
-
-    else:
-
-        st.dataframe(
-            news_df,
-            use_container_width=True
-        )
-
-
-    prompt = f"""
-Company: {company_name}
-Ticker: {ticker}
-
-Latest news:
-
-{news_df.to_string()}
-
-Summarize the latest news and explain:
-
-1. What happened
-2. Positive / negative / neutral
-3. Impact on revenue
-4. Impact on margins
-5. Impact on valuation
-6. Impact on investor sentiment
-7. Key risks to monitor
-"""
-
-    if st.button(
-        "Generate News AI Analysis"
-    ):
-
-        with st.spinner(
-            "Analyzing news..."
-        ):
-
-            st.markdown(
-                ai_report(prompt)
-            )
-
-
-# ============================================================
-# AI Equity Research Report
-# ============================================================
-
-elif page == "AI Report":
-
-    st.subheader(
-        "AI Equity Research Report"
+def data_notice() -> None:
+    st.markdown(
+        """
+        <div class="disclaimer">Market and fundamental data are sourced from Yahoo Finance and may be delayed,
+        incomplete or restated. Expected returns, VaR and simulations are model estimates—not forecasts or investment advice.</div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    financial_text = (
-        summary_df.to_string()
-        if not summary_df.empty
-        else "Financial data unavailable."
+
+def overview_page() -> None:
+    page_header(
+        "Personal investment intelligence",
+        "Research with a portfolio view.",
+        "A private workspace for company fundamentals, valuation, risk decomposition and evidence-led investment memos.",
     )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("<div class='panel'><h3>01 · Research</h3><p class='muted'>Price, fundamentals, quality, peer valuation and a reusable investment-thesis workflow.</p><span class='pill'>Single name</span><span class='pill'>Peers</span></div>", unsafe_allow_html=True)
+    with c2:
+        st.markdown("<div class='panel'><h3>02 · Value</h3><p class='muted'>Enterprise-to-equity DCF with net debt, scenarios and discount-rate sensitivity.</p><span class='pill'>DCF</span><span class='pill'>Sensitivity</span></div>", unsafe_allow_html=True)
+    with c3:
+        st.markdown("<div class='panel'><h3>03 · Portfolio</h3><p class='muted'>Expected return, volatility, drawdown, VaR, beta, correlations and marginal risk.</p><span class='pill'>Risk</span><span class='pill'>Monte Carlo</span></div>", unsafe_allow_html=True)
 
-    prompt = f"""
-Analyze this company as a professional equity research analyst.
-
-Company: {company_name}
-Ticker: {ticker}
-Sector: {sector}
-Industry: {industry}
-Current Price: {price}
-Market Cap: {market_cap}
-P/E: {pe}
-Forward P/E: {forward_pe}
-
-Financial Data:
-
-{financial_text}
-
-Write a structured equity research report:
-
-1. Business Overview
-2. Business Fundamentals
-3. Revenue Analysis
-4. Profitability Analysis
-5. Cash Flow Analysis
-6. Moat Analysis
-7. Growth Drivers
-8. Bull Case
-9. Bear Case
-10. Key Risks
-11. Investment Conclusion
-
-Do not provide personalized financial advice.
-"""
-
-    if st.button(
-        "Generate AI Report"
-    ):
-
-        with st.spinner(
-            "Generating AI Report..."
-        ):
-
-            st.markdown(
-                ai_report(prompt)
-            )
-
-
-# ============================================================
-# Watchlist
-# ============================================================
-
-elif page == "Watchlist":
-
-    st_autorefresh(
-        interval=60_000,
-        key="watchlist_refresh"
+    st.subheader("Research operating system")
+    workflow = pd.DataFrame(
+        {
+            "Stage": ["Screen", "Underwrite", "Value", "Size", "Monitor"],
+            "Decision question": [
+                "Is the opportunity worth analyst time?",
+                "What must be true for the thesis to work?",
+                "What is priced in across scenarios?",
+                "How much risk does the position add?",
+                "Which evidence would invalidate the thesis?",
+            ],
+            "FinLens module": ["Company Research", "Company Research + AI Memo", "Valuation", "Portfolio Lab", "AI Memo"],
+        }
     )
+    st.dataframe(workflow, hide_index=True, width="stretch")
+    data_notice()
 
-    st.subheader(
-        "Real-Time Watchlist"
-    )
 
-    tickers_input = st.text_area(
-        "Enter tickers separated by commas",
-        "ORCL,MSFT,NVDA,AAPL,TSM"
-    )
+def company_research_page(ticker: str) -> None:
+    with st.spinner(f"Loading {ticker} research data…"):
+        info, income, _, cashflow = company_bundle(ticker)
+        prices = price_history((ticker,), "5y")
+    if not info:
+        st.error(f"No company data was returned for {ticker}.")
+        return
 
-    tickers = [
-        ticker.strip().upper()
-        for ticker
-        in tickers_input.split(",")
-        if ticker.strip()
+    name = safe(info, "longName", ticker)
+    page_header("Company research", f"{name} · {ticker}", f"{safe(info, 'sector', '—')} / {safe(info, 'industry', '—')}")
+    price = safe(info, "currentPrice", safe(info, "regularMarketPrice"))
+    metrics = st.columns(6)
+    metric_values = [
+        ("Price", money(price)),
+        ("Market cap", money(safe(info, "marketCap"))),
+        ("Forward P/E", multiple(safe(info, "forwardPE"))),
+        ("EV / EBITDA", multiple(safe(info, "enterpriseToEbitda"))),
+        ("Revenue growth", percent(safe(info, "revenueGrowth"))),
+        ("ROIC proxy (ROA)", percent(safe(info, "returnOnAssets"))),
     ]
+    for column, (label, value) in zip(metrics, metric_values):
+        column.metric(label, value)
 
-    data = []
+    left, right = st.columns([1.7, 1])
+    with left:
+        st.subheader("Price & regime")
+        if prices.empty:
+            st.warning("Price history is unavailable.")
+        else:
+            line = px.line(prices, x=prices.index, y=ticker, labels={ticker: "Adjusted price", "index": "Date"})
+            line.update_layout(height=390, margin=dict(l=10, r=10, t=10, b=10), showlegend=False)
+            st.plotly_chart(line, width="stretch")
+    with right:
+        st.subheader("Market profile")
+        profile = pd.DataFrame(
+            {
+                "Metric": ["52-week low", "52-week high", "Beta", "Dividend yield", "Short % float", "Target mean"],
+                "Value": [
+                    money(safe(info, "fiftyTwoWeekLow")), money(safe(info, "fiftyTwoWeekHigh")),
+                    f"{safe(info, 'beta', '—')}", percent(safe(info, "dividendYield")),
+                    percent(safe(info, "shortPercentOfFloat")), money(safe(info, "targetMeanPrice")),
+                ],
+            }
+        )
+        st.dataframe(profile, hide_index=True, width="stretch")
 
-    for ticker_item in tickers:
+    tabs = st.tabs(["Fundamentals", "Peer set", "Business profile"])
+    with tabs[0]:
+        rows = []
+        if income is not None and not income.empty:
+            for column in income.columns[:4]:
+                revenue = float(income.loc["Total Revenue", column]) if "Total Revenue" in income.index else np.nan
+                operating = float(income.loc["Operating Income", column]) if "Operating Income" in income.index else np.nan
+                net_income = float(income.loc["Net Income", column]) if "Net Income" in income.index else np.nan
+                fcf = float(cashflow.loc["Free Cash Flow", column]) if cashflow is not None and "Free Cash Flow" in cashflow.index and column in cashflow.columns else np.nan
+                rows.append({"Period": pd.Timestamp(column).strftime("%Y"), "Revenue": money(revenue), "Operating income": money(operating), "Operating margin": percent(operating / revenue) if revenue else "—", "Net income": money(net_income), "Free cash flow": money(fcf)})
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        else:
+            st.warning("Financial statements are unavailable.")
+    with tabs[1]:
+        peer_input = st.text_input("Peer tickers", "MSFT,AMZN,GOOGL,META", help="Use comparable companies from the same economic value chain.")
+        peers = tuple(dict.fromkeys([ticker] + [item.strip().upper() for item in peer_input.split(",") if item.strip()]))
+        st.dataframe(display_peer_table(peer_snapshot(peers)), hide_index=True, width="stretch")
+    with tabs[2]:
+        st.write(safe(info, "longBusinessSummary", "Business description is unavailable."))
+        st.caption(f"Website: {safe(info, 'website', '—')} · Employees: {safe(info, 'fullTimeEmployees', '—')}")
+    data_notice()
 
+
+def valuation_page(ticker: str) -> None:
+    info, _, balance, cashflow = company_bundle(ticker)
+    name = safe(info, "longName", ticker)
+    page_header("Intrinsic value", f"DCF laboratory · {ticker}", f"Enterprise value bridge for {name} with explicit scenario assumptions.")
+    latest_fcf = statement_value(cashflow, ["Free Cash Flow"])
+    if valid_number(latest_fcf) and latest_fcf <= 0 and cashflow is not None and "Free Cash Flow" in cashflow.index:
+        positive_history = pd.to_numeric(cashflow.loc["Free Cash Flow"], errors="coerce")
+        positive_history = positive_history[positive_history > 0]
+        latest_fcf = float(positive_history.iloc[0]) if not positive_history.empty else None
+    if not valid_number(latest_fcf):
+        operating_cf = statement_value(cashflow, ["Operating Cash Flow", "Total Cash From Operating Activities"])
+        capex = statement_value(cashflow, ["Capital Expenditure", "Capital Expenditures"])
+        latest_fcf = operating_cf + capex if valid_number(operating_cf) and valid_number(capex) else None
+    debt = statement_value(balance, ["Total Debt"]) or 0.0
+    cash = statement_value(balance, ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"]) or 0.0
+    shares = safe(info, "sharesOutstanding")
+
+    assumptions, output = st.columns([1, 1.25])
+    with assumptions:
+        st.subheader("Assumptions")
+        fcf_input = st.number_input("Base free cash flow", min_value=0.0, value=float(latest_fcf or 1_000_000_000.0), step=10_000_000.0, format="%.0f", help="When the latest reported FCF is negative, FinLens uses the most recent positive historical value as a starting point. Normalize it before relying on the output.")
+        shares_input = st.number_input("Diluted shares", min_value=1.0, value=float(shares or 1_000_000_000.0), step=1_000_000.0, format="%.0f")
+        net_debt_input = st.number_input("Net debt (debt − cash)", value=float(debt - cash), step=10_000_000.0, format="%.0f")
+        growth = st.slider("FCF growth", -5.0, 30.0, 8.0, 0.5, format="%.1f%%") / 100
+        discount = st.slider("WACC / required return", 5.0, 18.0, 9.0, 0.25, format="%.2f%%") / 100
+        terminal = st.slider("Terminal growth", 0.0, 5.0, 2.5, 0.25, format="%.2f%%") / 100
+    try:
+        result = dcf_valuation(fcf_input, shares_input, net_debt_input, growth, discount, terminal)
+    except ValueError as error:
+        st.error(str(error))
+        return
+
+    current = safe(info, "currentPrice", safe(info, "regularMarketPrice"))
+    with output:
+        st.subheader("Value bridge")
+        a, b, c = st.columns(3)
+        a.metric("Fair value / share", money(result["fair_value_per_share"]))
+        b.metric("Current price", money(current))
+        upside = result["fair_value_per_share"] / current - 1 if valid_number(current) else None
+        c.metric("Implied upside", percent(upside))
+        bridge = pd.DataFrame({"Component": ["Enterprise value", "Less: net debt", "Equity value", "PV from terminal value"], "Value": [money(result["enterprise_value"]), money(net_debt_input), money(result["equity_value"]), percent(result["terminal_value_share"])]})
+        st.dataframe(bridge, hide_index=True, width="stretch")
+        projected = pd.DataFrame({"Year": range(1, 6), "Free cash flow": result["projected_fcfs"]})
+        chart = px.bar(projected, x="Year", y="Free cash flow")
+        chart.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(chart, width="stretch")
+
+    st.subheader("WACC × terminal-growth sensitivity")
+    wacc_values = np.linspace(max(terminal + 0.015, discount - 0.02), discount + 0.02, 5)
+    terminal_values = np.linspace(max(0.0, terminal - 0.01), min(0.05, terminal + 0.01), 5)
+    sensitivity = pd.DataFrame(index=[f"{value:.1%}" for value in wacc_values], columns=[f"{value:.1%}" for value in terminal_values])
+    for wacc in wacc_values:
+        for growth_terminal in terminal_values:
+            try:
+                value = dcf_valuation(fcf_input, shares_input, net_debt_input, growth, float(wacc), float(growth_terminal))["fair_value_per_share"]
+                sensitivity.loc[f"{wacc:.1%}", f"{growth_terminal:.1%}"] = round(value, 2)
+            except ValueError:
+                sensitivity.loc[f"{wacc:.1%}", f"{growth_terminal:.1%}"] = np.nan
+    st.caption("Rows: WACC · Columns: terminal growth · Values: fair value per share")
+    st.dataframe(sensitivity, width="stretch")
+    data_notice()
+
+
+def default_holdings() -> pd.DataFrame:
+    return pd.DataFrame({"Ticker": ["MSFT", "NVDA", "GOOGL", "AMZN", "BRK-B"], "Shares": [10.0, 15.0, 20.0, 12.0, 5.0], "Cost basis": [350.0, 120.0, 170.0, 180.0, 450.0]})
+
+
+def portfolio_page() -> None:
+    page_header("Portfolio intelligence", "Risk & return laboratory", "Translate positions into portfolio-level exposures, loss ranges and forward-looking scenarios.")
+    st.markdown("<div class='status'><span class='status-dot'></span>Session-only holdings · nothing is saved to the server</div>", unsafe_allow_html=True)
+    uploaded = st.file_uploader("Import holdings CSV", type=["csv"], help="Columns: Ticker, Shares, Cost basis (optional)")
+    if uploaded is not None:
         try:
-
-            info_item = (
-                yf.Ticker(
-                    ticker_item
-                ).info
-            )
-
-            data.append({
-                "Ticker": ticker_item,
-                "Name": info_item.get(
-                    "shortName",
-                    "N/A"
-                ),
-                "Regular Price":
-                    info_item.get(
-                        "regularMarketPrice",
-                        info_item.get(
-                            "currentPrice"
-                        )
-                    ),
-                "Pre-Market":
-                    info_item.get(
-                        "preMarketPrice"
-                    ),
-                "After-Hours":
-                    info_item.get(
-                        "postMarketPrice"
-                    ),
-                "Market Cap":
-                    info_item.get(
-                        "marketCap"
-                    ),
-                "P/E":
-                    info_item.get(
-                        "trailingPE"
-                    ),
-                "Sector":
-                    info_item.get(
-                        "sector",
-                        "N/A"
-                    ),
-            })
-
+            imported = pd.read_csv(uploaded)
+            if not {"Ticker", "Shares"}.issubset(imported.columns):
+                st.error("CSV must contain Ticker and Shares columns.")
+            else:
+                if "Cost basis" not in imported.columns:
+                    imported["Cost basis"] = np.nan
+                st.session_state["holdings"] = imported[["Ticker", "Shares", "Cost basis"]]
         except Exception:
-            continue
+            st.error("The CSV could not be read.")
 
-
-    df = pd.DataFrame(data)
-
-    if df.empty:
-
-        st.warning(
-            "Watchlist data unavailable."
-        )
-
-    else:
-
-        for col in [
-            "Regular Price",
-            "Pre-Market",
-            "After-Hours",
-            "Market Cap"
-        ]:
-
-            if col in df.columns:
-
-                df[col] = (
-                    df[col]
-                    .apply(fmt_money)
-                )
-
-        st.dataframe(
-            df,
-            use_container_width=True
-        )
-
-    st.caption(
-        "Data source: Yahoo Finance via yfinance. "
-        "Market data may be delayed or unavailable."
+    if "holdings" not in st.session_state:
+        st.session_state["holdings"] = default_holdings()
+    editor = st.data_editor(
+        st.session_state["holdings"], num_rows="dynamic", hide_index=True, width="stretch",
+        column_config={"Ticker": st.column_config.TextColumn(required=True), "Shares": st.column_config.NumberColumn(min_value=0.0, required=True, format="%.4f"), "Cost basis": st.column_config.NumberColumn(min_value=0.0, format="$%.2f")},
+        key="portfolio_editor",
     )
+    st.session_state["holdings"] = editor
+    holdings = editor.copy()
+    holdings["Ticker"] = holdings["Ticker"].astype(str).str.strip().str.upper()
+    holdings["Shares"] = pd.to_numeric(holdings["Shares"], errors="coerce")
+    holdings["Cost basis"] = pd.to_numeric(holdings["Cost basis"], errors="coerce")
+    holdings = holdings[(holdings["Ticker"] != "") & (holdings["Shares"] > 0)]
+    if holdings.empty:
+        st.info("Add at least one position to run the analysis.")
+        return
+
+    settings = st.columns(4)
+    period = settings[0].selectbox("History", ["1y", "3y", "5y", "10y"], index=2)
+    benchmark = settings[1].text_input("Benchmark", "SPY").strip().upper()
+    risk_free = settings[2].number_input("Risk-free rate", 0.0, 0.15, 0.04, 0.005, format="%.3f")
+    return_method = settings[3].selectbox("Expected return method", ["Historical mean", "Historical CAGR", "Exponentially weighted"])
+
+    tickers = tuple(dict.fromkeys(holdings["Ticker"].tolist()))
+    with st.spinner("Building the portfolio risk model…"):
+        all_prices = price_history(tuple(dict.fromkeys(tickers + (benchmark,))), period)
+    available = [ticker for ticker in tickers if ticker in all_prices.columns]
+    missing = sorted(set(tickers) - set(available))
+    if missing:
+        st.warning(f"No price history for: {', '.join(missing)}")
+    if not available:
+        st.error("No usable price history was returned.")
+        return
+
+    grouped = holdings.groupby("Ticker", as_index=False).agg({"Shares": "sum", "Cost basis": "mean"})
+    grouped = grouped[grouped["Ticker"].isin(available)].copy()
+    latest = all_prices[available].ffill().iloc[-1]
+    grouped["Price"] = grouped["Ticker"].map(latest)
+    grouped["Market value"] = grouped["Shares"] * grouped["Price"]
+    grouped["Weight"] = grouped["Market value"] / grouped["Market value"].sum()
+    grouped["Unrealized P&L"] = (grouped["Price"] - grouped["Cost basis"]) * grouped["Shares"]
+    grouped = grouped.sort_values("Market value", ascending=False)
+    analysis_tickers = grouped["Ticker"].tolist()
+    weights = normalize_weights(grouped["Weight"])
+    returns = daily_returns(all_prices[analysis_tickers])
+    benchmark_returns = all_prices[benchmark].pct_change(fill_method=None).dropna() if benchmark in all_prices.columns else None
+    if returns.empty or len(returns) < 20:
+        st.error("At least 20 common trading days are required for portfolio analysis.")
+        return
+
+    metrics = portfolio_metrics(returns, weights, benchmark_returns, risk_free, return_method)
+    portfolio_value = float(grouped["Market value"].sum())
+    metric_columns = st.columns(6)
+    headline = [("Portfolio value", money(portfolio_value)), ("Expected return", percent(metrics.expected_return)), ("Annual volatility", percent(metrics.volatility)), ("Sharpe ratio", f"{metrics.sharpe_ratio:.2f}"), ("Max drawdown", percent(metrics.max_drawdown)), ("1-day VaR 95%", money(metrics.var_95_daily * portfolio_value))]
+    for column, (label, value) in zip(metric_columns, headline):
+        column.metric(label, value)
+
+    tabs = st.tabs(["Positions", "Performance", "Risk decomposition", "Stress & simulation"])
+    with tabs[0]:
+        display = grouped.copy()
+        for column in ("Price", "Market value", "Unrealized P&L"):
+            display[column] = display[column].map(money)
+        display["Weight"] = display["Weight"].map(percent)
+        display["Cost basis"] = display["Cost basis"].map(money)
+        st.dataframe(display, hide_index=True, width="stretch")
+        allocation = px.bar(grouped, x="Ticker", y="Weight", color="Weight", color_continuous_scale="Teal")
+        allocation.update_layout(height=320, coloraxis_showscale=False, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(allocation, width="stretch")
+        st.download_button("Download current holdings", grouped[["Ticker", "Shares", "Cost basis"]].to_csv(index=False), "finlens-holdings.csv", "text/csv")
+    with tabs[1]:
+        portfolio_returns = returns.mul(weights, axis=1).sum(axis=1)
+        comparison = pd.DataFrame({"Portfolio": (1.0 + portfolio_returns).cumprod() * 100})
+        if benchmark_returns is not None:
+            common = comparison.index.intersection(benchmark_returns.index)
+            comparison = comparison.loc[common]
+            comparison[benchmark] = (1.0 + benchmark_returns.loc[common]).cumprod() * 100
+        chart = px.line(comparison, x=comparison.index, y=comparison.columns, labels={"value": "Growth of 100", "index": "Date", "variable": "Series"})
+        chart.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(chart, width="stretch")
+        ratio_columns = st.columns(5)
+        ratios = [("Sortino", metrics.sortino_ratio), ("Beta", metrics.beta), ("Tracking error", percent(metrics.tracking_error)), ("Information ratio", metrics.information_ratio), ("1-day CVaR 95%", money(metrics.cvar_95_daily * portfolio_value))]
+        for column, (label, value) in zip(ratio_columns, ratios):
+            formatted = f"{value:.2f}" if valid_number(value) and label not in ("Tracking error", "1-day CVaR 95%") else value
+            column.metric(label, formatted if formatted is not None else "—")
+    with tabs[2]:
+        left, right = st.columns(2)
+        heatmap = px.imshow(returns.corr(), text_auto=".2f", color_continuous_scale="RdBu_r", zmin=-1, zmax=1, aspect="auto")
+        heatmap.update_layout(height=430, margin=dict(l=10, r=10, t=30, b=10), title="Return correlation")
+        left.plotly_chart(heatmap, width="stretch")
+        contributions = risk_contributions(returns, weights).sort_values(ascending=False).reset_index()
+        contributions.columns = ["Ticker", "Risk contribution"]
+        risk_chart = px.bar(contributions, x="Ticker", y="Risk contribution", color="Risk contribution", color_continuous_scale="Oranges")
+        risk_chart.update_layout(height=430, coloraxis_showscale=False, margin=dict(l=10, r=10, t=30, b=10), title="Contribution to portfolio variance")
+        right.plotly_chart(risk_chart, width="stretch")
+        asset_expected = expected_asset_returns(returns, return_method)
+        scatter_data = pd.DataFrame({"Ticker": returns.columns, "Expected return": asset_expected, "Volatility": returns.std() * np.sqrt(252)})
+        scatter = px.scatter(scatter_data, x="Volatility", y="Expected return", text="Ticker", size=[16] * len(scatter_data))
+        scatter.update_traces(textposition="top center")
+        scatter.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10), title="Asset risk / return map")
+        st.plotly_chart(scatter, width="stretch")
+    with tabs[3]:
+        left, right = st.columns([0.9, 1.1])
+        with left:
+            st.subheader("Historical stress")
+            stress = historical_stress(returns, weights)
+            stress["Portfolio return"] = stress["Portfolio return"].map(percent)
+            st.dataframe(stress, hide_index=True, width="stretch")
+            years = st.slider("Simulation horizon (years)", 1, 15, 5)
+            simulations = st.select_slider("Simulation paths", options=[1_000, 2_500, 5_000, 10_000], value=5_000)
+        terminal_values = monte_carlo_terminal_values(returns, weights, portfolio_value, years, simulations)
+        summary = terminal_summary(terminal_values, portfolio_value)
+        with right:
+            st.subheader("Monte Carlo terminal value")
+            histogram = px.histogram(x=terminal_values, nbins=55, labels={"x": "Terminal portfolio value", "count": "Paths"})
+            histogram.add_vline(x=portfolio_value, line_dash="dash", line_color="#46d6a0")
+            histogram.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(histogram, width="stretch")
+        summary_columns = st.columns(4)
+        for column, (label, value) in zip(summary_columns, summary.items()):
+            column.metric(label, percent(value) if label == "Probability of loss" else money(value))
+    data_notice()
+
+
+def ai_memo_page(ticker: str) -> None:
+    page_header("Research copilot", "AI investment memo", "Use the model to challenge a thesis and structure evidence—not to replace primary research.")
+    api_key = secret_value("OPENAI_API_KEY")
+    if not api_key or OpenAI is None:
+        st.error("OpenAI is not configured for this environment.")
+        return
+    info, _, balance, cashflow = company_bundle(ticker)
+    memo_type = st.selectbox("Memo type", ["Initiation of coverage", "Thesis stress test", "Earnings preparation", "Risk register"])
+    notes = st.text_area("Your thesis, questions and known evidence", height=220, placeholder="Example: Revenue growth is accelerating, but capex intensity and customer concentration may be underappreciated…")
+    include_financials = st.checkbox("Include summarized company financial data", value=True)
+    st.caption("Only the ticker, selected public company data and the notes above are sent when you click Generate.")
+    if st.button("Generate analyst memo", type="primary"):
+        financial_context = ""
+        if include_financials:
+            financial_context = f"""
+Public company context:
+- Company: {safe(info, 'longName', ticker)} ({ticker})
+- Sector / industry: {safe(info, 'sector', 'N/A')} / {safe(info, 'industry', 'N/A')}
+- Market cap: {safe(info, 'marketCap')}
+- Forward P/E: {safe(info, 'forwardPE')}
+- Revenue growth: {safe(info, 'revenueGrowth')}
+- EBITDA margin: {safe(info, 'ebitdaMargins')}
+- Latest FCF: {statement_value(cashflow, ['Free Cash Flow'])}
+- Total debt: {statement_value(balance, ['Total Debt'])}
+"""
+        prompt = f"""
+Memo type: {memo_type}
+Ticker: {ticker}
+Analyst notes:
+{notes or 'No analyst notes supplied; identify the minimum evidence needed before forming a view.'}
+{financial_context}
+
+Produce a concise professional equity-research memo with:
+1. Executive view and confidence level
+2. What the market may be pricing in
+3. Three thesis pillars with evidence required
+4. Bull, base and bear cases (clearly labeled as scenarios, not forecasts)
+5. Variant perception
+6. Catalysts and timeline
+7. Risk register with leading indicators
+8. Disconfirming evidence and next research actions
+Do not provide personalized investment advice. Flag missing or stale data explicitly.
+"""
+        try:
+            with st.spinner("Drafting the memo…"):
+                client = OpenAI(api_key=api_key, timeout=30.0, max_retries=1)
+                response = client.responses.create(
+                    model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+                    instructions="You are a skeptical institutional equity research analyst. Separate facts, assumptions and inferences. Never invent financial data or citations.",
+                    input=prompt,
+                    max_output_tokens=2200,
+                    store=False,
+                )
+            st.markdown(response.output_text)
+            st.download_button("Download memo", response.output_text, f"{ticker.lower()}-{memo_type.lower().replace(' ', '-')}.md", "text/markdown")
+        except Exception as error:
+            st.error("The memo could not be generated. Check API access, model availability and project billing.")
+            st.caption(type(error).__name__)
+    data_notice()
+
+
+def methodology_page() -> None:
+    page_header("Model governance", "Methodology & limitations", "A professional tool is explicit about assumptions, data lineage and where its outputs can fail.")
+    sections = {
+        "Expected return": "Historical mean annualizes average daily returns; CAGR compounds the observed sample; exponentially weighted estimates emphasize recent returns. None is a reliable standalone forecast.",
+        "Risk": "Volatility and covariance use daily adjusted-price returns with 252 trading days. Risk contribution allocates total portfolio variance using marginal covariance.",
+        "VaR / CVaR": "Historical 95% VaR is the fifth-percentile one-day loss. CVaR is the average loss in that tail. Both can understate regime shifts and illiquidity.",
+        "Monte Carlo": "Terminal values use a lognormal process calibrated to historical portfolio mean and volatility. Paths are scenarios, not price targets.",
+        "DCF": "The model discounts explicit FCF, adds a Gordon-growth terminal value, then subtracts net debt to bridge enterprise to equity value.",
+        "Privacy": "Holdings remain in the Streamlit session and are not stored by FinLens. AI requests send only the information shown on the AI Memo page after an explicit click.",
+    }
+    for title, body in sections.items():
+        st.markdown(f"### {title}\n{body}")
+    data_notice()
+
+
+require_authentication()
+st.sidebar.markdown("## ◈ FINLENS")
+st.sidebar.caption("PRIVATE RESEARCH TERMINAL")
+page = st.sidebar.radio("Workspace", ["Overview", "Company Research", "Valuation", "Portfolio Lab", "AI Memo", "Methodology"], label_visibility="collapsed")
+st.sidebar.divider()
+ticker = st.sidebar.text_input("Active ticker", st.session_state.get("ticker", "ORCL")).strip().upper()
+st.session_state["ticker"] = ticker or "ORCL"
+st.sidebar.markdown("<div class='status'><span class='status-dot'></span>Private session active</div>", unsafe_allow_html=True)
+if st.sidebar.button("Lock workspace", width="stretch"):
+    st.session_state["authenticated"] = False
+    st.rerun()
+
+if page == "Overview":
+    overview_page()
+elif page == "Company Research":
+    company_research_page(st.session_state["ticker"])
+elif page == "Valuation":
+    valuation_page(st.session_state["ticker"])
+elif page == "Portfolio Lab":
+    portfolio_page()
+elif page == "AI Memo":
+    ai_memo_page(st.session_state["ticker"])
+else:
+    methodology_page()
