@@ -1,8 +1,8 @@
 streamlit
 requests
 pandas
+numpy
 yfinance
 plotly
 python-dotenv
 openai
-streamlit-autorefresh

@@ -1,4 +1,6 @@
 .env
-venv/
+.env.local
+.streamlit/secrets.toml
 __pycache__/
-.DS_Store
+.pytest_cache/
+.venv/
